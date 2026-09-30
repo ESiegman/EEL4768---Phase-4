@@ -1,0 +1,216 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  self-check:
+    runs-on: ubuntu-latest
+    # Needed to push generated schematic PNGs to the ci-schematics-img
+    # branch (see "Publish schematics" below) so the job summary can embed
+    # a real https:// URL -- GitHub's job-summary sanitizer strips data:
+    # URIs and doesn't render local/relative image paths at all.
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Icarus Verilog, yosys and librsvg
+        run: |
+          set -e
+          sudo rm -f /etc/apt/sources.list.d/google-chrome.list || true
+          sudo apt-get clean
+          sudo rm -rf /var/lib/apt/lists/*
+          for i in 1 2 3; do
+            if sudo apt-get update; then
+              break
+            fi
+            if [ "$i" -eq 3 ]; then
+              exit 1
+            fi
+            sleep 5
+          done
+          sudo apt-get install -y iverilog yosys librsvg2-bin
+
+      - name: Install netlistsvg
+        run: npm install -g netlistsvg
+
+      - name: Run your testbenches
+        id: check
+        run: |
+          set +e
+          ./run_test.sh ci
+          echo "status=$?" >> "$GITHUB_OUTPUT"
+
+      - name: Generate gate-level schematics
+        id: schematics
+        if: always()
+        run: |
+          set +e
+          ./gen_schematics.sh
+          echo "status=$?" >> "$GITHUB_OUTPUT"
+
+      - name: Publish schematics for the job summary
+        id: publish
+        if: always()
+        run: |
+          set -e
+          if ! ls build/schematics/*.png >/dev/null 2>&1; then
+            echo "published=0" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          WORKDIR="$(mktemp -d)"
+          AUTH_URL="https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
+
+          if git clone --quiet --depth 1 --branch ci-schematics-img "${AUTH_URL}" "${WORKDIR}" 2>/dev/null; then
+            :
+          else
+            git clone --quiet --depth 1 "${AUTH_URL}" "${WORKDIR}"
+            git -C "${WORKDIR}" checkout --orphan ci-schematics-img
+            git -C "${WORKDIR}" rm -rf --quiet . || true
+          fi
+
+          rm -rf "${WORKDIR}/schematics"
+          mkdir -p "${WORKDIR}/schematics"
+          cp build/schematics/*.png "${WORKDIR}/schematics/"
+
+          git -C "${WORKDIR}" config user.name "github-actions[bot]"
+          git -C "${WORKDIR}" config user.email "github-actions[bot]@users.noreply.github.com"
+          git -C "${WORKDIR}" add -A
+          if git -C "${WORKDIR}" diff --cached --quiet; then
+            echo "No change in generated schematics, nothing to push."
+          else
+            git -C "${WORKDIR}" commit --quiet -m "Schematics for ${{ github.sha }} [skip ci]"
+            git -C "${WORKDIR}" push --quiet -f "${AUTH_URL}" HEAD:ci-schematics-img
+          fi
+          echo "published=1" >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Build job summary
+        if: always()
+        shell: python
+        env:
+          PUBLISHED: ${{ steps.publish.outputs.published }}
+        run: |
+          import os
+          import re
+          from pathlib import Path
+
+          summary_path = Path("results/ci.txt")
+          step_summary = os.environ["GITHUB_STEP_SUMMARY"]
+
+          if not summary_path.exists():
+              with open(step_summary, "a") as f:
+                  f.write(
+                      "# 🔴 Phase 4 self-check — crashed before producing a summary\n\n"
+                      "See the **Run your testbenches** step's log for the traceback "
+                      "(likely a missing iverilog install or a bad run_test.sh invocation).\n"
+                  )
+              print("::error::self-check crashed before writing results/ci.txt")
+              raise SystemExit(0)
+
+          icons = {"PASS": "✅", "FAIL": "❌", "SKIP": "⚪"}
+          rows = []
+          for line in summary_path.read_text().splitlines():
+              m = re.match(r"^(PASS|FAIL|SKIP)\s+(.*)$", line)
+              if not m:
+                  continue
+              status, rest = m.groups()
+              label, _, reason = rest.partition("  --  ")
+              rows.append((status, re.sub(r"\s+", " ", label.strip()), reason.strip()))
+
+          total = len(rows)
+          passed = sum(1 for status, _, _ in rows if status == "PASS")
+          failed = sum(1 for status, _, _ in rows if status == "FAIL")
+          skipped = total - passed - failed
+          emoji = "🔴" if failed else ("🟡" if skipped else "🟢")
+
+          lines = [
+              f"# {emoji} Phase 4 self-check — {passed} passed, {failed} failed, {skipped} skipped",
+              "",
+              "| | Module | Notes |",
+              "|---|---|---|",
+          ]
+          for status, label, reason in rows:
+              lines.append(f"| {icons.get(status, '❔')} | `{label}` | {reason} |")
+          lines.append("")
+
+          lines += [
+              "> There is no autograder for phase 4 — this only runs *your own* "
+              "testbenches (`<module>_tb.v`) against `<module>.v`. A module with no "
+              "testbench yet shows as skipped, not failed.",
+              "",
+              "Compile/sim logs and waveforms are attached below as the "
+              "`self-check-output` artifact.",
+              "",
+          ]
+
+          schem_dir = Path("build/schematics")
+          svgs = sorted(p.stem for p in schem_dir.glob("*.svg")) if schem_dir.exists() else []
+          modules = ["alu", "imm", "rf", "decoder", "hart"]
+          lines.append("### Gate-level schematics (yosys + netlistsvg)")
+          lines.append("")
+
+          # Rendered via a real https:// URL, not a data: URI -- GitHub's
+          # job-summary sanitizer strips data: URIs and doesn't render
+          # local/relative image paths at all (confirmed against a live
+          # run; see github.com/orgs/community/discussions/35932 and
+          # /101814). The "Publish schematics" step force-pushes each PNG
+          # to the ci-schematics-img branch, so this links raw content off
+          # that branch. Requires the repo to be public -- for a private
+          # repo, GitHub's camo proxy can't authenticate to fetch it and
+          # this would render as a broken image instead.
+          published = os.environ.get("PUBLISHED") == "1"
+          repo = os.environ["GITHUB_REPOSITORY"]
+          for name in modules:
+              png_path = schem_dir / f"{name}.png"
+              if not png_path.exists():
+                  lines.append(f"<details><summary><code>{name}</code> -- not generated</summary></details>")
+                  continue
+              if not published:
+                  lines.append(
+                      f"<details><summary><code>{name}</code> -- generated but not "
+                      f"published, see the artifact</summary></details>"
+                  )
+                  continue
+              url = f"https://raw.githubusercontent.com/{repo}/ci-schematics-img/schematics/{name}.png"
+              lines.append(
+                  f'<details open><summary><code>{name}</code></summary>\n\n'
+                  f'![{name} schematic]({url})\n'
+                  f'</details>'
+              )
+              lines.append("")
+
+          with open(step_summary, "a") as f:
+              f.write("\n".join(lines) + "\n")
+
+          for status, label, reason in rows:
+              if status == "FAIL":
+                  print(f"::error file={label}.v,title={label}::{reason or 'check failed'}")
+
+          print(f"::notice title=Phase 4 self-check::{passed} passed, {failed} failed, {skipped} skipped")
+          print(f"::notice title=Schematics::{len(svgs)}/{len(modules)} generated")
+
+      - name: Upload run artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: self-check-output
+          path: |
+            results/
+            build/
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Fail the job if any testbench failed
+        if: steps.check.outputs.status != '0'
+        run: exit 1

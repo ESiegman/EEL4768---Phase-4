@@ -1,0 +1,8 @@
+# run_test.sh output.
+results/
+build/
+*.vcd
+
+__pycache__/
+*.pyc
+.DS_Store
