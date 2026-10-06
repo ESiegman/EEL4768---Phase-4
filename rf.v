@@ -6,19 +6,20 @@
 // write port, allowing a register to be written to on the next clock edge.
 //
 // The register `x0` is hardwired to zero.
-// NOTE: This can be implemented either by silently discarding writesto
+// NOTE: This can be implemented either by silently discarding writes to
 // address 5'd0, or by muxing the output to zero when reading from that
 // address.
 module rf #
 (
-    // When this parameter is set to 1, "RF bypass" mode is enabled. This
-    // allows data at the write port to be observed at the read ports
-    // immediately without having to wait for the next clock edge. This is
-    // a common forwarding optimization in a pipelined core (phase 5), but will
-    // cause a single-cycle processor to behave incorrectly. You are required
-    // to implement and test both modes. In phase 4, you will disable this
-    // parameter, before enabling it in phase 6.
-    parameter BYPASS_EN = 0
+    // When this parameter is set to 1, "RF bypass" mode is enabled. A value
+    // at the write port is seen on the read ports in the same cycle, without
+    // waiting for the next clock edge (a write to x0 is never bypassed).
+    // When it is 0, reads return only the stored value until the edge.
+    //
+    // Phase 4 instantiates rf with BYPASS_EN = 1 (phase_4.pdf section 4.4),
+    // so that is the default, matching the TA skeleton. Both modes must be
+    // implemented; rf_bypass_tb.v and rf_no_bypass_tb.v test one each.
+    parameter BYPASS_EN = 1
 ) 
 
 (
@@ -47,7 +48,7 @@ module rf #
     // clock edge.
     // A write to 5'd0 is discarded, so x0 stays zero.
     //
-    // Write register enable, address [0, 31] and input data.
+    // Write register address [0, 31] and input data.
     input  wire [ 4:0] i_rd_waddr,
     input  wire [31:0] i_rd_wdata
 );
@@ -61,15 +62,13 @@ generate
     for (i = 1; i < 32; i = i + 1) begin : g_regs
     always @(posedge i_clk)
     begin
-    //reset is checked first
+    //reset is checked first, so it wins over a write in the same cycle
         if (i_rst)
         //resets all registers to 0.
         regs[i] <= 32'd0;
-        //this condition passes if write enable is on and the write
-        //Phase 3 Change:
-        // (i_rd_wen && (i_rd_waddr == i)) -> (i_rd_waddr == i)
-        // with no more write enable must delete from here too.
-        else if (i_rd_waddr == i)   // was: (i_rd_wen && (i_rd_waddr == i))
+        //there is no write enable: the register is written when the write
+        //address selects it (address 0 selects nothing, so it means "no write")
+        else if (i_rd_waddr == i)
         //when neither of the conditions are met, the register holds the value
         regs[i] <= i_rd_wdata;
     end
@@ -84,8 +83,7 @@ wire [31:0] rs2_stored = (i_rs2_raddr == 5'd0) ? 32'd0 : regs[i_rs2_raddr];
 generate
 if (BYPASS_EN != 0)
 begin : g_bypass
-    //Phase 3 Changes:
-    // * removed i_rd_wen from rs1_byp and rs2_byp
+    //bypass when reading the register being written this cycle (never x0)
     wire rs1_byp = (i_rs1_raddr == i_rd_waddr) && (i_rs1_raddr != 5'd0);
     wire rs2_byp = (i_rs2_raddr == i_rd_waddr) && (i_rs2_raddr != 5'd0);
     assign o_rs1_rdata = rs1_byp ? i_rd_wdata : rs1_stored;
