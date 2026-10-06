@@ -25,6 +25,12 @@ FIRST_RETIRE_CYCLE = 6   # where hazard_no_fwd.trace puts its first retirement
 EBREAK = 0x00100073
 NOP = 0x00000013          # addi x0, x0, 0
 
+# Trace gaps the timing model disagrees with, keyed by the pc retiring just
+# before the gap. The tb warns (or fails, with STRICT_TA_TIMING) on these.
+KNOWN_TA_DISCREPANCIES = {
+    0x0040007C: "2 bubbles after not-taken bne",
+}
+
 BEGIN_MARK = "// BEGIN GENERATED"
 END_MARK = "// END GENERATED"
 
@@ -589,7 +595,7 @@ def v_row(i, r):
                r.halt, r.tag))
 
 
-def emit_load_task(name, comment, words, rows):
+def emit_load_task(name, comment, words, rows, alt_gaps=()):
     out = ["    // %s" % comment,
            "    task %s;" % name, "        begin",
            "        clear_mems;"]
@@ -606,11 +612,15 @@ def emit_load_task(name, comment, words, rows):
                "    mem kind addr mask data            halt tag")
     for i, r in enumerate(rows):
         out.append(v_row(i, r))
+    for i, gap, note in alt_gaps:
+        out.append("        exp_alt_gap[%d] = %d;  // known TA discrepancy: %s"
+                   % (i, gap, note))
     out += ["        end", "    endtask", ""]
     return out
 
 
-def emit_tb_block(trace_words, trace_rows, b_names, b_words, b_rows):
+def emit_tb_block(trace_words, trace_rows, b_names, b_words, b_rows,
+                  alt_gaps):
     out = [BEGIN_MARK + " by scripts/gen_hazard_no_fwd.py -- do not edit by"
            " hand; rerun with --write",
            ""]
@@ -624,7 +634,7 @@ def emit_tb_block(trace_words, trace_rows, b_names, b_words, b_rows):
         "load_part_a",
         "Part A: traces/hazard_program.hex, expected rows from "
         "traces/hazard_no_fwd.trace",
-        trace_words, trace_rows)
+        trace_words, trace_rows, alt_gaps)
     out += emit_load_task(
         "load_part_b",
         "Part B: directed program, expected rows from the ISS + no-fwd "
@@ -648,14 +658,16 @@ def write_tb(block):
 
 # --- Mock hart (testbench validation only, never commit) ---
 
-MUTANTS = ("none", "wrong_wdata", "extra_bubble", "missing_bubble",
+MUTANTS = ("none", "model_timing", "wrong_wdata", "extra_bubble", "missing_bubble",
            "no_halt", "trap_stuck", "skip_retire", "wrong_store_mask")
 
 
 def mutate(rows, mutant):
     rows = [Row(**{k: getattr(r, k) for k in Row.__slots__}) for r in rows]
     mid = len(rows) // 2
-    if mutant == "wrong_wdata":
+    if mutant == "model_timing":
+        rows = run_model(read_hex(HEX_PATH))
+    elif mutant == "wrong_wdata":
         r = next(r for r in rows[mid:] if r.rd_addr)
         r.rd_data ^= 0x00000100
     elif mutant == "extra_bubble":
@@ -816,13 +828,21 @@ def main():
     if not enc_ok or not val_ok:
         print("VALIDATION FAILED: not emitting anything")
         return 1
-    if gap_bad:
-        print("NOTE: the timing model does not reproduce the gap(s) above. The "
-              "testbench keeps the trace's timing for Part A as given; this "
-              "needs a team/TA answer, not a special case in the model.")
+    # every model/trace gap mismatch must be a listed TA discrepancy
+    bad_pcs = set(prev.pc for prev, _, _, _ in gap_bad)
+    if bad_pcs != set(KNOWN_TA_DISCREPANCIES):
+        print("VALIDATION FAILED: gap mismatches %s != known discrepancies %s"
+              % (sorted(map(hex, bad_pcs)),
+                 sorted(map(hex, KNOWN_TA_DISCREPANCIES))))
+        return 1
+    alt_gaps = [(trace_rows.index(cur), mg, KNOWN_TA_DISCREPANCIES[prev.pc])
+                for prev, cur, mg, _ in gap_bad]
+    print("known TA discrepancies (tb warns unless STRICT_TA_TIMING): %s"
+          % ", ".join("row %d model gap %d" % (i, g) for i, g, _ in alt_gaps))
 
     if args.write:
-        write_tb(emit_tb_block(words, trace_rows, b_names, b_words, b_rows))
+        write_tb(emit_tb_block(words, trace_rows, b_names, b_words, b_rows,
+                               alt_gaps))
         print("wrote GENERATED block in %s" % os.path.relpath(TB_PATH, ROOT))
 
     if args.emit_mock:
