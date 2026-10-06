@@ -1,34 +1,11 @@
 #!/usr/bin/env python3
-"""Generate the data tables embedded in hart_hazard_no_fwd_tb.v.
+"""Generate the expected-retirement tables in hart_hazard_no_fwd_tb.v.
 
-Standard library only. Run from anywhere:
-
-    python3 scripts/gen_hazard_no_fwd.py             # validate, print report
-    python3 scripts/gen_hazard_no_fwd.py --write     # ...and rewrite the
-                                                     # GENERATED block in the tb
+    python3 scripts/gen_hazard_no_fwd.py            # validate against the trace
+    python3 scripts/gen_hazard_no_fwd.py --write    # also update the testbench
     python3 scripts/gen_hazard_no_fwd.py --emit-mock OUT.v [--mutant NAME]
-                                                     # replay model of `hart`
-                                                     # for testing the tb itself
-                                                     # (never commit OUT.v)
-
-What it does:
-  1. Parses traces/hazard_program.hex and traces/hazard_no_fwd.trace into
-     expected-retirement rows (Part A of the testbench).
-  2. Contains a tiny RV32I encoder/decoder and ISS for the opcodes the tests
-     use (addi add sub lui auipc lw sw beq bne ebreak), plus a timing model
-     of a 5-stage pipeline with no forwarding and no rf bypass:
-       - a consumer may retire no earlier than 4 cycles after the most recent
-         producer of each register it actually reads, i.e. max(0, 4 - d)
-         bubbles at distance d (3, 2, 1, 0),
-       - 2 bubbles after a taken branch (resolved in EX),
-       - in order, one retirement per cycle at most.
-     "Reads rs1 / reads rs2 / writes rd" come from the decoded instruction
-     class, never from raw bit fields, and writes to x0 produce nothing.
-  3. Re-encodes every word in hazard_program.hex and checks it round-trips.
-  4. Runs ISS + timing model on hazard_program.hex and diffs the result
-     against hazard_no_fwd.trace, every cycle and every field.
-  5. Builds the directed program (Part B) and its expected table from the
-     same ISS + timing model, and emits Verilog for both parts.
+                                                    # replay hart, for testing
+                                                    # the tb (don't commit it)
 """
 
 import argparse
@@ -54,12 +31,9 @@ END_MARK = "// END GENERATED"
 M32 = 0xFFFFFFFF
 
 
-# ---------------------------------------------------------------------------
-# Encoder / decoder
-# ---------------------------------------------------------------------------
+# --- Encoder / decoder ---
 
-# Instruction classes: which operands an instruction *architecturally* uses.
-#                reads_rs1 reads_rs2 writes_rd
+# per class:     reads_rs1 reads_rs2 writes_rd
 CLASS = {
     "addi":   (True,  False, True),
     "add":    (True,  True,  True),
@@ -153,9 +127,7 @@ def disasm(w):
     return op
 
 
-# ---------------------------------------------------------------------------
-# ISS + timing model
-# ---------------------------------------------------------------------------
+# --- ISS + timing model ---
 
 class Row:
     """One expected retirement. Field names mirror the testbench arrays."""
@@ -182,13 +154,10 @@ class Row:
 
 def run_model(words, tags=None, first_cycle=FIRST_RETIRE_CYCLE,
               max_retire=10000):
-    """Execute `words` (loaded at IMEM_BASE) and return the retirement rows.
+    """Run `words` from IMEM_BASE and return the retirement rows.
 
-    Timing (no forwarding, no rf bypass): register values are written in WB
-    and read in ID, three stages earlier, so a consumer's ID must come after
-    its producer's WB:  retire(consumer) >= retire(producer) + 4.
-    A taken branch resolves in EX and flushes two younger instructions:
-    retire(next) >= retire(branch) + 3.
+    No forwarding or bypass: a consumer retires >= 4 cycles after its
+    producer, and the instruction after a taken branch >= 3 cycles after it.
     """
     regs = [0] * 32
     mem = {}
@@ -270,9 +239,7 @@ def run_model(words, tags=None, first_cycle=FIRST_RETIRE_CYCLE,
     raise RuntimeError("program did not reach ebreak")
 
 
-# ---------------------------------------------------------------------------
-# Trace I/O
-# ---------------------------------------------------------------------------
+# --- Trace I/O ---
 
 def read_hex(path):
     with open(path) as f:
@@ -356,9 +323,7 @@ def format_trace(rows):
     return out
 
 
-# ---------------------------------------------------------------------------
-# Part B: directed program
-# ---------------------------------------------------------------------------
+# --- Part B: directed program ---
 
 def nop():
     return ("addi", 0, 0, 0, 0)
@@ -369,12 +334,9 @@ def I(op, rd=0, rs1=0, rs2=0, imm=0):
 
 
 def directed_program():
-    """Return a list of (case_name, [instructions]) blocks.
+    """Return (case_name, [instructions]) blocks, each after 4 NOPs.
 
-    Every case is preceded by 4 NOPs so no case can see a producer from the
-    one before it. Expected bubbles under the no-fwd model in [brackets].
-    Register roles: x28 = DMEM_BASE pointer, x9 = filler destination that is
-    never read by the case it sits in.
+    Expected bubbles are in [brackets]. x28 = dmem base, x9 = unused filler.
     """
     P = 4
     cases = []
@@ -392,7 +354,7 @@ def directed_program():
         I("addi", rd=30, imm=0x3E),
     ])
 
-    # 1. RAW distance --------------------------------------------------------
+    # 1. RAW distance
     case("RAW d=1 on rs1 [3]", [
         I("addi", rd=10, imm=11),
         I("add", rd=11, rs1=10, rs2=0),
@@ -432,7 +394,7 @@ def directed_program():
         I("sub", rd=14, rs1=12, rs2=13),
     ])
 
-    # 2. Load-use ------------------------------------------------------------
+    # 2. Load-use
     case("load-use setup: store 0x1A6 to 0x20(x28)", [
         I("sw", rs1=28, rs2=16, imm=0x20),
     ])
@@ -446,7 +408,7 @@ def directed_program():
         I("add", rd=15, rs1=0, rs2=14),
     ])
 
-    # 3. Load-store ----------------------------------------------------------
+    # 3. Load-store
     case("load-store: loaded value is store data [3]", [
         I("lw", rd=12, rs1=28, imm=0x20),
         I("sw", rs1=28, rs2=12, imm=0x40),
@@ -467,7 +429,7 @@ def directed_program():
         I("lw", rd=21, rs1=28, imm=0x60),
     ])
 
-    # 4. False dependencies (all [0]) ---------------------------------------
+    # 4. False dependencies (all [0])
     case("false dep: PDF case, addi imm=1 looks like rs2=x1 [0]", [
         I("add", rd=1, rs1=0, rs2=2),
         I("addi", rd=3, rs1=0, imm=1),
@@ -502,7 +464,7 @@ def directed_program():
         I("add", rd=29, rs1=0, rs2=0),
     ])
 
-    # 5. No-hazard classes (all [0]) ----------------------------------------
+    # 5. No-hazard classes (all [0])
     case("RAR [0]", [
         I("add", rd=7, rs1=5, rs2=6),
         I("add", rd=9, rs1=5, rs2=0),
@@ -519,7 +481,7 @@ def directed_program():
         I("add", rd=31, rs1=7, rs2=0),
     ])
 
-    # 6. Branches ------------------------------------------------------------
+    # 6. Branches
     case("taken beq [2 after], skipped addi never retires", [
         I("beq", rs1=5, rs2=5, imm=8),
         I("addi", rd=9, imm=0x7FF),          # skipped
@@ -546,9 +508,7 @@ def build_directed():
     return names, words, tags
 
 
-# ---------------------------------------------------------------------------
-# Validation
-# ---------------------------------------------------------------------------
+# --- Validation ---
 
 def validate_encoder(words):
     ok = True
@@ -617,9 +577,7 @@ def validate_model(words, trace_rows, halt_cycle):
     return ok, gap_bad
 
 
-# ---------------------------------------------------------------------------
-# Verilog emission
-# ---------------------------------------------------------------------------
+# --- Verilog emission ---
 
 def v_row(i, r):
     return ("        set_row(%3d, %4d, 32'h%08x, 32'h%08x, %d, 5'd%-2d, 32'h%08x, "
@@ -688,9 +646,7 @@ def write_tb(block):
         f.write(new)
 
 
-# ---------------------------------------------------------------------------
-# Mock hart (for validating the testbench only; never commit its output)
-# ---------------------------------------------------------------------------
+# --- Mock hart (testbench validation only, never commit) ---
 
 MUTANTS = ("none", "wrong_wdata", "extra_bubble", "missing_bubble",
            "no_halt", "trap_stuck", "skip_retire", "wrong_store_mask")
@@ -724,12 +680,7 @@ def mutate(rows, mutant):
 
 
 def emit_mock(path, parts, mutant):
-    """A `hart` that ignores its inputs and replays the expected rows.
-
-    It counts resets to know which part it is in, and counts cycles since the
-    last reset so that row `cycle` N is driven during the N-th cycle the
-    testbench samples (i.e. while the cycle counter reads N - 1).
-    """
+    """Write a `hart` that ignores its inputs and replays the expected rows."""
     lines = []
     w = lines.append
     total = sum(len(p) for p in parts)
@@ -822,7 +773,6 @@ def emit_mock(path, parts, mutant):
         f.write("\n".join(lines) + "\n")
 
 
-# ---------------------------------------------------------------------------
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])

@@ -1,20 +1,10 @@
 `timescale 1ns / 1ps
 `default_nettype none
 
-// Self-checking testbench for rf with BYPASS_EN = 0.
-//
-// What makes this different from rf_bypass_tb: a read of the register being
-// written this cycle must return the OLD (stored) value until the clock edge
-// commits the write. An rf with bypass turned on fails section 4 here.
-//
-// Timing discipline, used everywhere below (clock period 10, posedge at
-// multiples of 10, negedge at 5 past):
-//   - inputs change only at a negedge (`sync` waits for one),
-//   - combinational reads are checked at negedge + #1, + #2, ... and never
-//     more than four reads per half cycle, so every check lands well before
-//     the next posedge,
-//   - a write's result is checked only after the posedge that commits it.
-// Nothing is ever sampled on the posedge that commits a write.
+// Testbench for rf with BYPASS_EN = 0: a same-cycle read of the register
+// being written must return the OLD value.
+// Inputs change at negedge, reads are checked just after it, and write
+// results are only checked after the posedge that commits them.
 module rf_no_bypass_tb;
 
     reg         clk;
@@ -57,7 +47,7 @@ module rf_no_bypass_tb;
         end
     endtask
 
-    // Drive both read addresses, settle for #1, and check both ports.
+    // set both read addresses, wait #1, check both ports
     task read2;
         input [511:0] label;
         input [  4:0] a1;
@@ -68,8 +58,7 @@ module rf_no_bypass_tb;
             rs1_raddr = a1;
             rs2_raddr = a2;
             #1;
-            // Guard the timing discipline itself: a check must land in the
-            // low half of the clock, between a negedge and the next posedge.
+            // checks must land while clk is low, before the next posedge
             check({label, " (testbench timing: clk low)"}, {31'd0, clk},
                   32'd0);
             check({label, " (rs1)"}, rs1_rdata, want1);
@@ -77,15 +66,14 @@ module rf_no_bypass_tb;
         end
     endtask
 
-    // Wait for the next negedge (crossing one posedge). Inputs left as they
-    // are, so whatever was being driven gets committed at that posedge.
+    // wait one cycle, keeping the current inputs
     task sync;
         begin
             @(negedge clk);
         end
     endtask
 
-    // Wait for the next negedge, then idle the write port and drop reset.
+    // wait one cycle, then idle the write port and drop reset
     task next_cycle;
         begin
             @(negedge clk);
@@ -95,7 +83,7 @@ module rf_no_bypass_tb;
         end
     endtask
 
-    // Called at a negedge: write one register, return at the next negedge.
+    // write one register (called at a negedge)
     task write_reg;
         input [ 4:0] addr;
         input [31:0] data;
@@ -106,8 +94,7 @@ module rf_no_bypass_tb;
         end
     endtask
 
-    // A distinct value for every register, so a read from the wrong address
-    // is never mistaken for the right one. x1..x3 hold edge-case patterns.
+    // distinct value per register; x1..x3 are edge cases
     function [31:0] pat;
         input [4:0] r;
         begin
@@ -133,7 +120,7 @@ module rf_no_bypass_tb;
 
         $display("========== rf_no_bypass testbench ==========");
 
-        // Two cycles of reset, released at a negedge.
+        // 2 cycles of reset
         sync;
         sync;
         rst = 1'b0;
@@ -174,8 +161,7 @@ module rf_no_bypass_tb;
             read2("all regs: same register on both ports", i[4:0],
                   pat(i[4:0]), i[4:0], pat(i[4:0]));
         end
-        // rs2 walks the other direction, so each port sees every register
-        // while the other port reads a different one.
+        // rs2 walks backwards so the two ports read different registers
         for (i = 1; i < 32; i = i + 1) begin
             sync;
             read2("all regs: different registers per port", i[4:0],

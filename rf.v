@@ -11,14 +11,8 @@
 // address.
 module rf #
 (
-    // When this parameter is set to 1, "RF bypass" mode is enabled. A value
-    // at the write port is seen on the read ports in the same cycle, without
-    // waiting for the next clock edge (a write to x0 is never bypassed).
-    // When it is 0, reads return only the stored value until the edge.
-    //
-    // Phase 4 instantiates rf with BYPASS_EN = 1 (phase_4.pdf section 4.4),
-    // so that is the default, matching the TA skeleton. Both modes must be
-    // implemented; rf_bypass_tb.v and rf_no_bypass_tb.v test one each.
+    // 1: a write is visible on the read ports in the same cycle (bypass).
+    // Phase 4 uses 1 (phase_4.pdf 4.4); both modes are tested.
     parameter BYPASS_EN = 1
 ) 
 
