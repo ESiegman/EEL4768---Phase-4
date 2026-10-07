@@ -165,6 +165,17 @@ module decoder (
   assign o_rd_sel[3] = is_load;
   assign o_rd = (|o_rd_sel) ? rd : 5'd0;
 
+  //phase 4
+  //4.2.3 False Dependencies
+    //describes the issue when the pipeline detects a dependencyh that doesn't exit
+    //the document says this can happen from immediate values that align with register
+    //bitfields thus creating false dependencies
+    
+    //these outputs run off the "is" wires which exclude illegal encodings.
+  assign o_uses_rs1 = is_op|is_op_imm|is_load|is_branch|is_jalr;
+  assign o_uses_rs2 = is_op|is_store|is_branch;
+  assign o_is_load = is_load;
+    
 endmodule
 
 `default_nettype wire
