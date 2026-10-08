@@ -1,77 +1,275 @@
-module rf_no_bypass_tb();
-    reg clk;
-    reg rst;
-    reg [4:0] rs1_raddr;
+`timescale 1ns / 1ps
+`default_nettype none
+
+// Testbench for rf with BYPASS_EN = 0: a same-cycle read of the register
+// being written must return the OLD value.
+// Inputs change at negedge, reads are checked just after it, and write
+// results are only checked after the posedge that commits them.
+module rf_no_bypass_tb;
+
+    reg         clk;
+    reg         rst;
+    reg  [ 4:0] rs1_raddr;
+    reg  [ 4:0] rs2_raddr;
+    reg  [ 4:0] rd_waddr;
+    reg  [31:0] rd_wdata;
     wire [31:0] rs1_rdata;
-    reg [4:0] rs2_raddr;
     wire [31:0] rs2_rdata;
-    reg [4:0] rd_waddr;
-    reg [31:0] rd_wdata;
+
+    integer passed;
+    integer failed;
     integer i;
-    integer errors;
 
-    rf #(0) dut (
-        .i_clk(clk),
-        .i_rst(rst),
-        .i_rs1_raddr(rs1_raddr),
-        .o_rs1_rdata(rs1_rdata),
-        .i_rs2_raddr(rs2_raddr),
-        .o_rs2_rdata(rs2_rdata),
-        .i_rd_waddr(rd_waddr),
-        .i_rd_wdata(rd_wdata)
+    rf #(.BYPASS_EN(0)) dut (
+        .i_clk       (clk),
+        .i_rst       (rst),
+        .i_rs1_raddr (rs1_raddr),
+        .o_rs1_rdata (rs1_rdata),
+        .i_rs2_raddr (rs2_raddr),
+        .o_rs2_rdata (rs2_rdata),
+        .i_rd_waddr  (rd_waddr),
+        .i_rd_wdata  (rd_wdata)
     );
-
-    initial begin
-        errors = 0;
-        clk = 0;
-        rst = 1;
-        rs1_raddr = 5'b0;
-        rs2_raddr = 5'b0;
-        rd_waddr = 5'b0;
-        rd_wdata = 32'b0;
-
-        repeat (2) @(posedge clk);
-        rst = 0;
-        @(posedge clk);
-
-        // write to x0
-        @(negedge clk);
-        rd_waddr = 5'b00000;
-        rd_wdata = 32'hDEADBEEF;
-        @(posedge clk);
-        @(negedge clk);
-        rd_waddr = 5'b00000;
-        @(posedge clk);
-        if (rs1_rdata !== 32'b0) begin errors = errors + 1; $display("TEST FAILED: Write to x0 should not update register"); end
-
-        // write to each of the other registers and read them back
-        for (i = 1; i < 32; i = i + 1) begin
-            // write
-            @(negedge clk);
-            rd_waddr = i[4:0];
-            rd_wdata = {12'b0, i[4:0], i[4:0], i[4:0], i[4:0]}; // pattern
-            @(posedge clk);
-            @(negedge clk);
-            rd_waddr = 5'b00000;
-            @(posedge clk);
-
-            // read back rs1
-            rs1_raddr = i[4:0];
-            @(posedge clk);
-            if (rs1_rdata !== {12'b0, i[4:0], i[4:0], i[4:0], i[4:0]}) 
-                begin errors = errors + 1; $display("TEST FAILED: RS1 read back %08h for x%0d, expected %08h", rs1_rdata, i, {12'b0, i[4:0], i[4:0], i[4:0], i[4:0]}); end
-
-            // read back rs2
-            rs2_raddr = i[4:0];
-            @(posedge clk);
-            if (rs2_rdata !== {12'b0, i[4:0], i[4:0], i[4:0], i[4:0]}) 
-                begin errors = errors + 1; $display("TEST FAILED: RS2 read back %08h for x%0d, expected %08h", rs2_rdata, i, {12'b0, i[4:0], i[4:0], i[4:0], i[4:0]}); end
-        end
-        if (errors == 0) $display("ALL TESTS PASSED");
-        else             $display("TEST FAILED");
-        $finish;
-    end
 
     always #5 clk = ~clk;
 
+    task check;
+        input [511:0] label;
+        input [ 31:0] got;
+        input [ 31:0] want;
+        begin
+            if (got === want) begin
+                passed = passed + 1;
+            end else begin
+                failed = failed + 1;
+                $display("[FAIL] %0s: got %h, expected %h", label, got, want);
+            end
+        end
+    endtask
+
+    // set both read addresses, wait #1, check both ports
+    task read2;
+        input [511:0] label;
+        input [  4:0] a1;
+        input [ 31:0] want1;
+        input [  4:0] a2;
+        input [ 31:0] want2;
+        begin
+            rs1_raddr = a1;
+            rs2_raddr = a2;
+            #1;
+            // checks must land while clk is low, before the next posedge
+            check({label, " (testbench timing: clk low)"}, {31'd0, clk},
+                  32'd0);
+            check({label, " (rs1)"}, rs1_rdata, want1);
+            check({label, " (rs2)"}, rs2_rdata, want2);
+        end
+    endtask
+
+    // wait one cycle, keeping the current inputs
+    task sync;
+        begin
+            @(negedge clk);
+        end
+    endtask
+
+    // wait one cycle, then idle the write port and drop reset
+    task next_cycle;
+        begin
+            @(negedge clk);
+            rd_waddr = 5'd0;
+            rd_wdata = 32'd0;
+            rst      = 1'b0;
+        end
+    endtask
+
+    // write one register (called at a negedge)
+    task write_reg;
+        input [ 4:0] addr;
+        input [31:0] data;
+        begin
+            rd_waddr = addr;
+            rd_wdata = data;
+            next_cycle;
+        end
+    endtask
+
+    // distinct value per register; x1..x3 are edge cases
+    function [31:0] pat;
+        input [4:0] r;
+        begin
+            case (r)
+                5'd1:    pat = 32'hFFFFFFFF;
+                5'd2:    pat = 32'h80000000;
+                5'd3:    pat = 32'h00000001;
+                default: pat = {3'b101, r, ~{3'b000, r}, 3'b011, r, 8'h3C};
+            endcase
+        end
+    endfunction
+
+    initial begin
+        passed = 0;
+        failed = 0;
+
+        clk       = 1'b0;
+        rst       = 1'b1;
+        rs1_raddr = 5'd0;
+        rs2_raddr = 5'd0;
+        rd_waddr  = 5'd0;
+        rd_wdata  = 32'd0;
+
+        $display("========== rf_no_bypass testbench ==========");
+
+        // 2 cycles of reset
+        sync;
+        sync;
+        rst = 1'b0;
+
+        // --- 1. Reset clears every register ----------------------------------
+        $display("--- 1. reset ---");
+        write_reg(5'd1,  32'h11111111);
+        write_reg(5'd7,  32'h77777777);
+        write_reg(5'd16, 32'h16161616);
+        write_reg(5'd31, 32'h31313131);
+        read2("reset: x7/x31 written before reset", 5'd7, 32'h77777777,
+              5'd31, 32'h31313131);
+        sync;
+        rst = 1'b1;
+        next_cycle;
+        for (i = 0; i < 32; i = i + 1) begin
+            sync;
+            read2("reset: register reads 0 after reset", i[4:0], 32'd0,
+                  i[4:0], 32'd0);
+        end
+
+        // --- 2. x0 is hardwired to zero --------------------------------------
+        $display("--- 2. x0 ---");
+        sync;
+        rd_waddr = 5'd0;
+        rd_wdata = 32'hDEADBEEF;
+        read2("x0: during write of DEADBEEF", 5'd0, 32'd0, 5'd0, 32'd0);
+        next_cycle;
+        read2("x0: after write of DEADBEEF", 5'd0, 32'd0, 5'd0, 32'd0);
+
+        // --- 3. Every register x1..x31 holds its own value --------------------
+        $display("--- 3. all registers ---");
+        sync;
+        for (i = 1; i < 32; i = i + 1)
+            write_reg(i[4:0], pat(i[4:0]));
+        for (i = 1; i < 32; i = i + 1) begin
+            sync;
+            read2("all regs: same register on both ports", i[4:0],
+                  pat(i[4:0]), i[4:0], pat(i[4:0]));
+        end
+        // rs2 walks backwards so the two ports read different registers
+        for (i = 1; i < 32; i = i + 1) begin
+            sync;
+            read2("all regs: different registers per port", i[4:0],
+                  pat(i[4:0]), 6'd32 - i[5:0], pat(6'd32 - i[5:0]));
+        end
+        sync;
+        read2("all regs: x0 still zero", 5'd0, 32'd0, 5'd0, 32'd0);
+
+        // --- 4. No bypass: a same-cycle read sees the OLD value ---------------
+        $display("--- 4. same-cycle read returns old value ---");
+        sync;
+        rd_waddr = 5'd5;
+        rd_wdata = 32'hA5A5A5A5;
+        read2("no bypass: x5 before edge reads old", 5'd5, pat(5'd5),
+              5'd5, pat(5'd5));
+        #2;
+        read2("no bypass: x5 late in cycle reads old", 5'd5, pat(5'd5),
+              5'd5, pat(5'd5));
+        next_cycle;
+        read2("no bypass: x5 after edge reads new", 5'd5, 32'hA5A5A5A5,
+              5'd5, 32'hA5A5A5A5);
+
+        sync;
+        rd_waddr = 5'd17;
+        rd_wdata = 32'h00000000;
+        read2("no bypass: x17 before edge reads old", 5'd17, pat(5'd17),
+              5'd17, pat(5'd17));
+        next_cycle;
+        read2("no bypass: x17 after edge reads new", 5'd17, 32'h00000000,
+              5'd17, 32'h00000000);
+
+        sync;
+        rd_waddr = 5'd31;
+        rd_wdata = 32'h0BADF00D;
+        read2("no bypass: x31 before edge reads old", 5'd31, pat(5'd31),
+              5'd31, pat(5'd31));
+        next_cycle;
+        read2("no bypass: x31 after edge reads new", 5'd31, 32'h0BADF00D,
+              5'd31, 32'h0BADF00D);
+
+        // One port on the register being written, the other elsewhere.
+        sync;
+        rd_waddr = 5'd1;
+        rd_wdata = 32'h12345678;
+        read2("no bypass: rs1=x1 (being written), rs2=x2", 5'd1, pat(5'd1),
+              5'd2, pat(5'd2));
+        read2("no bypass: rs1=x2, rs2=x1 (being written)", 5'd2, pat(5'd2),
+              5'd1, pat(5'd1));
+        next_cycle;
+        read2("no bypass: x1 after edge", 5'd1, 32'h12345678, 5'd2, pat(5'd2));
+
+        // --- 5. Ports and registers are independent ---------------------------
+        $display("--- 5. independence ---");
+        sync;
+        read2("independence: rs1=x3, rs2=x30", 5'd3, pat(5'd3),
+              5'd30, pat(5'd30));
+        read2("independence: rs1=x30, rs2=x3", 5'd30, pat(5'd30),
+              5'd3, pat(5'd3));
+        sync;
+        rd_waddr = 5'd10;
+        rd_wdata = 32'hCAFEBABE;
+        read2("independence: x11/x9 while writing x10", 5'd11, pat(5'd11),
+              5'd9, pat(5'd9));
+        next_cycle;
+        read2("independence: x11/x9 after writing x10", 5'd11, pat(5'd11),
+              5'd9, pat(5'd9));
+        read2("independence: x10 written", 5'd10, 32'hCAFEBABE,
+              5'd10, 32'hCAFEBABE);
+
+        // --- 6. Back-to-back writes to one register: last one wins ------------
+        $display("--- 6. last write wins ---");
+        sync;
+        rd_waddr = 5'd12;
+        rd_wdata = 32'h1111AAAA;
+        sync;
+        rd_waddr = 5'd12;
+        rd_wdata = 32'h2222BBBB;
+        read2("last write: x12 between the two writes", 5'd12, 32'h1111AAAA,
+              5'd12, 32'h1111AAAA);
+        next_cycle;
+        read2("last write: x12 after both writes", 5'd12, 32'h2222BBBB,
+              5'd12, 32'h2222BBBB);
+
+        // --- 7. Reset beats a write in the same cycle ------------------------
+        $display("--- 7. reset priority ---");
+        sync;
+        write_reg(5'd20, 32'h20202020);
+        read2("reset priority: x20 set up", 5'd20, 32'h20202020,
+              5'd20, 32'h20202020);
+        sync;
+        rst      = 1'b1;
+        rd_waddr = 5'd20;
+        rd_wdata = 32'hFEEDFACE;
+        next_cycle;
+        read2("reset priority: x20 is 0, not the write data", 5'd20, 32'd0,
+              5'd20, 32'd0);
+        read2("reset priority: other registers also 0", 5'd10, 32'd0,
+              5'd31, 32'd0);
+
+        $display("============================================");
+        $display("%0d passed, %0d failed", passed, failed);
+        if (failed == 0)
+            $display("ALL TESTS PASSED");
+        else
+            $display("TEST FAILED");
+        $finish;
+    end
+
 endmodule
+
+`default_nettype wire
