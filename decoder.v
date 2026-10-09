@@ -82,7 +82,11 @@ module decoder (
     output wire [ 3:0] o_rd_sel,
     // If asserted, the PC jumps to the target address calculated by the ALU
     // rather than directly to the PC + immediate. This is used for JALR.
-    output wire        o_pc_sel
+    output wire        o_pc_sel,
+    //phase 4
+    output wire        o_uses_rs1,
+    output wire        o_uses_rs2,
+    output wire        o_is_load
 );
   wire [6:0] opcode = i_inst[6:0];
   wire [4:0] rd = i_inst[11:7];
@@ -172,7 +176,7 @@ module decoder (
     //bitfields thus creating false dependencies
     
     //these outputs run off the "is" wires which exclude illegal encodings.
-  assign o_uses_rs1 = is_op|is_op_imm|is_load|is_branch|is_jalr;
+  assign o_uses_rs1 = is_op|is_op_imm|is_load|is_store|is_branch|is_jalr;
   assign o_uses_rs2 = is_op|is_store|is_branch;
   assign o_is_load = is_load;
     
