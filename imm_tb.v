@@ -10,6 +10,7 @@ module imm_tb;
 
     integer passed;
     integer failed;
+    reg verbose;
 
     localparam [5:0] FMT_R = 6'b000001;
     localparam [5:0] FMT_I = 6'b000010;
@@ -37,7 +38,7 @@ module imm_tb;
 
             if (immediate === want_immediate) begin
                 passed = passed + 1;
-                $display("[PASS] %0s", label);
+                if (verbose) $display("[PASS] %0s", label);
             end else begin
                 failed = failed + 1;
                 $display("[FAIL] %0s", label);
@@ -74,12 +75,28 @@ module imm_tb;
     reg [ 5:0] random_format;
     reg [31:0] expected;
 
+    // Encode an independently chosen signed offset, then require the
+    // generator to recover that value despite unrelated instruction bits.
+    task check_j_offset;
+        input [31:0] offset;
+        reg [31:0] encoded;
+        begin
+            encoded = $random(seed);
+            encoded[31] = offset[20];
+            encoded[30:21] = offset[10:1];
+            encoded[20] = offset[11];
+            encoded[19:12] = offset[19:12];
+            check("J: signed offset round trip", encoded, FMT_J, offset);
+        end
+    endtask
+
     initial begin
         $dumpfile("imm.vcd");
         $dumpvars(0, imm_tb);
 
         passed = 0;
         failed = 0;
+        verbose = 1;
         $display("========== immediate generator testbench ==========");
 
         // R has no immediate.  This imm.v deliberately drives zero rather
@@ -120,6 +137,51 @@ module imm_tb;
         check("J: split positive pattern",        32'h4dfa_b000, FMT_J, 32'h000a_bcde);
         check("J: split negative pattern",        32'hd56f_f000, FMT_J, 32'hffff_f556);
         check("J: most negative offset",          32'h8000_0000, FMT_J, 32'hfff0_0000);
+
+        $display("--- exhaustive signed I/S/B offsets ---");
+        verbose = 0;
+        seed = 32'd4768;
+        for (i = -2048; i < 2048; i = i+1) begin
+            random_inst = $random(seed);
+            random_inst[31:20] = i[11:0];
+            check("I: exhaustive offset with unrelated bits", random_inst, FMT_I, i);
+            random_inst = $random(seed);
+            random_inst[31:25] = i[11:5];
+            random_inst[11:7] = i[4:0];
+            check("S: exhaustive offset with unrelated bits", random_inst, FMT_S, i);
+        end
+        for (i = -4096; i < 4096; i = i+2) begin
+            random_inst = $random(seed);
+            random_inst[31] = i[12];
+            random_inst[7] = i[11];
+            random_inst[30:25] = i[10:5];
+            random_inst[11:8] = i[4:1];
+            check("B: exhaustive even offset with unrelated bits", random_inst, FMT_B, i);
+        end
+
+        $display("--- U/J bit placement and sign boundaries ---");
+        for (i = 12; i < 32; i = i+1) begin
+            expected = 32'd1 << i;
+            random_inst = expected | ($random(seed) & 32'h00000fff);
+            check("U: walking upper bit and ignored low bits", random_inst, FMT_U, expected);
+        end
+        for (i = 1; i < 20; i = i+1) begin
+            check_j_offset(32'd1 << i);
+            check_j_offset(-(32'd1 << i));
+        end
+        check_j_offset(32'hfff00000);
+        check_j_offset(32'h000ffffe);
+        check_j_offset(32'hfffffffe);
+        check_j_offset(32'h00000000);
+
+        // Exercise every malformed one-hot selector, independently of the
+        // random reference model. This implementation defines them as zero.
+        for (i = 0; i < 64; i = i+1) begin
+            case (i)
+                1, 2, 4, 8, 16, 32: begin end
+                default: check("invalid format returns zero", $random(seed), i[5:0], 32'd0);
+            endcase
+        end
 
         // Random tests exercise all six valid selectors.  A fixed seed makes
         // a failure repeatable.
