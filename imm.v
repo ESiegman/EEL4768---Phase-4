@@ -1,3 +1,5 @@
+`default_nettype none
+
 // The immediate generator is responsible for decoding the 32-bit
 // sign-extended immediate from the incoming instruction word. It is a purely
 // combinational block that is expected to be embedded in the instruction
@@ -87,3 +89,5 @@ module imm (
     assign o_immediate = immediate;
 
 endmodule
+
+`default_nettype wire

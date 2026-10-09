@@ -25,8 +25,8 @@ FIRST_RETIRE_CYCLE = 6   # where hazard_no_fwd.trace puts its first retirement
 EBREAK = 0x00100073
 NOP = 0x00000013          # addi x0, x0, 0
 
-# Trace gaps the timing model disagrees with, keyed by the pc retiring just
-# before the gap. The tb warns (or fails, with STRICT_TA_TIMING) on these.
+# Source-trace gaps the no-bypass model disagrees with, keyed by the pc
+# retiring just before the gap. The emitted tables use BYPASS_EN=1 timing.
 KNOWN_TA_DISCREPANCIES = {
     0x0040007C: "2 bubbles after not-taken bne",
 }
@@ -159,11 +159,11 @@ class Row:
 
 
 def run_model(words, tags=None, first_cycle=FIRST_RETIRE_CYCLE,
-              max_retire=10000):
+              max_retire=10000, bypass_en=True):
     """Run `words` from IMEM_BASE and return the retirement rows.
 
-    No forwarding or bypass: a consumer retires >= 4 cycles after its
-    producer, and the instruction after a taken branch >= 3 cycles after it.
+    No forwarding: a consumer retires >= 3 cycles after its producer with
+    RF bypass, or >= 4 without it. Taken branches flush two younger stages.
     """
     regs = [0] * 32
     mem = {}
@@ -189,7 +189,8 @@ def run_model(words, tags=None, first_cycle=FIRST_RETIRE_CYCLE,
                 cycle = max(cycle, prev_cycle + 3)
             for used, reg in ((r1, rs1), (r2, rs2)):
                 if used and reg != 0 and reg in last_writer_cycle:
-                    cycle = max(cycle, last_writer_cycle[reg] + 4)
+                    cycle = max(cycle, last_writer_cycle[reg] +
+                                (3 if bypass_en else 4))
 
         # ---- values --------------------------------------------------------
         a = regs[rs1] if r1 else 0
@@ -361,16 +362,16 @@ def directed_program():
     ])
 
     # 1. RAW distance
-    case("RAW d=1 on rs1 [3]", [
+    case("RAW d=1 on rs1 [2]", [
         I("addi", rd=10, imm=11),
         I("add", rd=11, rs1=10, rs2=0),
     ])
-    case("RAW d=2 on rs1 and rs2 [2]", [
+    case("RAW d=2 on rs1 and rs2 [1]", [
         I("addi", rd=10, imm=22),
         I("addi", rd=9, imm=1),
         I("add", rd=11, rs1=10, rs2=10),
     ])
-    case("RAW d=3 [1]", [
+    case("RAW d=3 [0]", [
         I("addi", rd=10, imm=33),
         I("addi", rd=9, imm=1),
         I("addi", rd=9, imm=2),
@@ -383,17 +384,17 @@ def directed_program():
         I("addi", rd=9, imm=3),
         I("add", rd=11, rs1=10, rs2=0),
     ])
-    case("RAW d=1 on rs2 only [3]", [
+    case("RAW d=1 on rs2 only [2]", [
         I("addi", rd=10, imm=55),
         I("add", rd=11, rs1=0, rs2=10),
     ])
-    case("RAW max rule: rs1 d=3, rs2 d=1 [3]", [
+    case("RAW max rule: rs1 d=3, rs2 d=1 [2]", [
         I("addi", rd=12, imm=-7),
         I("addi", rd=9, imm=1),
         I("addi", rd=13, imm=100),
         I("sub", rd=14, rs1=12, rs2=13),
     ])
-    case("RAW max rule: rs1 d=2, rs2 d=3 [2]", [
+    case("RAW max rule: rs1 d=2, rs2 d=3 [1]", [
         I("addi", rd=13, imm=5),
         I("addi", rd=12, imm=50),
         I("addi", rd=9, imm=1),
@@ -404,18 +405,18 @@ def directed_program():
     case("load-use setup: store 0x1A6 to 0x20(x28)", [
         I("sw", rs1=28, rs2=16, imm=0x20),
     ])
-    case("load-use d=1 [3]", [
+    case("load-use d=1 [2]", [
         I("lw", rd=14, rs1=28, imm=0x20),
         I("add", rd=15, rs1=14, rs2=14),
     ])
-    case("load-use d=2 [2]", [
+    case("load-use d=2 [1]", [
         I("lw", rd=14, rs1=28, imm=0x20),
         I("addi", rd=9, imm=1),
         I("add", rd=15, rs1=0, rs2=14),
     ])
 
     # 3. Load-store
-    case("load-store: loaded value is store data [3]", [
+    case("load-store: loaded value is store data [2]", [
         I("lw", rd=12, rs1=28, imm=0x20),
         I("sw", rs1=28, rs2=12, imm=0x40),
     ])
@@ -426,7 +427,7 @@ def directed_program():
         I("addi", rd=9, imm=3),
         I("sw", rs1=28, rs2=17, imm=0x24),
     ])
-    case("load-store: loaded value is store base [3]", [
+    case("load-store: loaded value is store base [2]", [
         I("lw", rd=18, rs1=28, imm=0x24),
         I("sw", rs1=18, rs2=19, imm=0),
     ])
@@ -535,9 +536,11 @@ def validate_encoder(words):
 
 
 def validate_model(words, trace_rows, halt_cycle):
-    model = run_model(words)
+    # The supplied trace's adjacent dependencies assume RF bypass is off.
+    # Validate that source unchanged, then emit timing for PDF 4.4 below.
+    model = run_model(words, bypass_en=False)
     ok = True
-    print("model: %d retirements, halts at cycle %d; trace: %d retirements, "
+    print("source no-bypass model: %d retirements, halts at cycle %d; trace: %d retirements, "
           "halts at cycle %d" % (len(model), model[-1].cycle,
                                  len(trace_rows), halt_cycle))
 
@@ -595,7 +598,7 @@ def v_row(i, r):
                r.halt, r.tag))
 
 
-def emit_load_task(name, comment, words, rows, alt_gaps=()):
+def emit_load_task(name, comment, words, rows):
     out = ["    // %s" % comment,
            "    task %s;" % name, "        begin",
            "        clear_mems;"]
@@ -612,15 +615,11 @@ def emit_load_task(name, comment, words, rows, alt_gaps=()):
                "    mem kind addr mask data            halt tag")
     for i, r in enumerate(rows):
         out.append(v_row(i, r))
-    for i, gap, note in alt_gaps:
-        out.append("        exp_alt_gap[%d] = %d;  // known TA discrepancy: %s"
-                   % (i, gap, note))
     out += ["        end", "    endtask", ""]
     return out
 
 
-def emit_tb_block(trace_words, trace_rows, b_names, b_words, b_rows,
-                  alt_gaps):
+def emit_tb_block(trace_words, trace_rows, b_names, b_words, b_rows):
     out = [BEGIN_MARK + " by scripts/gen_hazard_no_fwd.py -- do not edit by"
            " hand; rerun with --write",
            ""]
@@ -632,13 +631,11 @@ def emit_tb_block(trace_words, trace_rows, b_names, b_words, b_rows,
     out += ["        end", "    endtask", ""]
     out += emit_load_task(
         "load_part_a",
-        "Part A: traces/hazard_program.hex, expected rows from "
-        "traces/hazard_no_fwd.trace",
-        trace_words, trace_rows, alt_gaps)
+        "Part A: hazard_no_fwd.trace values, BYPASS_EN=1 timing model",
+        trace_words, trace_rows)
     out += emit_load_task(
         "load_part_b",
-        "Part B: directed program, expected rows from the ISS + no-fwd "
-        "timing model",
+        "Part B: directed program, ISS + no-fwd/BYPASS_EN=1 timing model",
         b_words, b_rows)
     out.append("    " + END_MARK)
     return out
@@ -666,7 +663,8 @@ def mutate(rows, mutant):
     rows = [Row(**{k: getattr(r, k) for k in Row.__slots__}) for r in rows]
     mid = len(rows) // 2
     if mutant == "model_timing":
-        rows = run_model(read_hex(HEX_PATH))
+        # Replay the old no-bypass timing; the BYPASS_EN=1 bench must reject it.
+        rows = run_model(read_hex(HEX_PATH), bypass_en=False)
     elif mutant == "wrong_wdata":
         r = next(r for r in rows[mid:] if r.rd_addr)
         r.rd_data ^= 0x00000100
@@ -835,18 +833,21 @@ def main():
               % (sorted(map(hex, bad_pcs)),
                  sorted(map(hex, KNOWN_TA_DISCREPANCIES))))
         return 1
-    alt_gaps = [(trace_rows.index(cur), mg, KNOWN_TA_DISCREPANCIES[prev.pc])
-                for prev, cur, mg, _ in gap_bad]
-    print("known TA discrepancies (tb warns unless STRICT_TA_TIMING): %s"
-          % ", ".join("row %d model gap %d" % (i, g) for i, g, _ in alt_gaps))
+    print("source trace discrepancy confirmed; emitted timing uses BYPASS_EN=1")
+    # Preserve the supplied expected values and change only their timing.
+    a_rows = [Row(**{k: getattr(r, k) for k in Row.__slots__})
+              for r in trace_rows]
+    for row, timed in zip(a_rows, run_model(words)):
+        row.cycle = timed.cycle
+    print("Part A BYPASS_EN=1: %d retirements, halts at model cycle %d"
+          % (len(a_rows), a_rows[-1].cycle))
 
     if args.write:
-        write_tb(emit_tb_block(words, trace_rows, b_names, b_words, b_rows,
-                               alt_gaps))
+        write_tb(emit_tb_block(words, a_rows, b_names, b_words, b_rows))
         print("wrote GENERATED block in %s" % os.path.relpath(TB_PATH, ROOT))
 
     if args.emit_mock:
-        a, b = trace_rows, b_rows
+        a, b = a_rows, b_rows
         if args.mutant_part == "A":
             a = mutate(a, args.mutant)
         else:

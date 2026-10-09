@@ -1,220 +1,145 @@
-# Phase 4 trace test
+# Phase 4 hart trace tests
 
-A self-checking testbench and the recorded vectors it replays, so you can
-check your pipelined `hart.v` on your own machine with nothing but Icarus
-Verilog. It drives **13675 vectors** and checks **13675 sets of outputs**
-against what an independent RV32I simulator (not any reference `hart.v`)
-computed for exactly that execution.
+The assignment is in [`../documentation/phase_4.pdf`](../documentation/phase_4.pdf).
+These files supply inputs and expected results for three CPU configurations:
 
-| test | drives | vectors |
-| --- | --- | --- |
-| `hart` | `hart` (and `alu`/`imm`/`rf`/`decoder` inside it) | 13675 instructions actually retired |
+| Check | Program | Expected trace | FWD_EN | BYPASS_EN |
+| --- | --- | --- | --- | --- |
+| `hart_no_hazard` | `no_hazard_program.hex` | `no_hazard.trace` | 0 | 1 |
+| `hart_hazard_no_fwd` | `hazard_program.hex` | `hazard_no_fwd.trace` | 0 | 1 |
+| `hart_hazard_fwd` | `hazard_program.hex` | `hazard_fwd.trace` | 1 | 1 |
 
-This is **not** the trace you are graded on. It is a different, much larger
-set covering the same behaviour, generated a different way (bulk random
-generation with a fixed seed, rather than the hand-written programs the
-grader uses) -- so passing here is evidence your design is right rather
-than evidence you matched one particular list of test cases.
+All three tests explicitly set `RESET_ADDR=0x00400000`. Register-file bypass
+is enabled in both hazard configurations, as section 4.4 requires.
 
-## Running it
+## Running
 
-Put your Verilog in `submission/` and run:
+From the repository root, with Bash, GNU Make and Icarus Verilog available:
 
 ```sh
-./run_traces.sh
+make hart
+make hart_no_hazard
+make hart_hazard_no_fwd
+make hart_hazard_fwd
 ```
 
-or point it at wherever your files already live:
+Without Make, use `CHECKS='hart_no_hazard hart_hazard_no_fwd hart_hazard_fwd'
+./run_test.sh local` on one line. Logs are written under `build/`, and the
+summary is written under `results/`. The runner passes absolute program and
+trace paths to the shared checker, so invoking it from another directory works
+too. The standalone no-forwarding bench embeds its program and expected tables.
+
+`hart_no_hazard_tb.v` contains the shared memory models, parser and checker.
+The forwarding testbench instantiates it with different parameters; its compile
+command must include that shared file. The no-forwarding bench is standalone
+and also runs person 3's directed program. For example:
 
 ```sh
-./run_traces.sh ~/eel4768/phase_4
+mkdir -p build
+iverilog -g2005 -s hart_hazard_fwd_tb -o build/hart_hazard_fwd_sim \
+    hart_hazard_fwd_tb.v hart_no_hazard_tb.v hart.v alu.v imm.v rf.v decoder.v
+vvp build/hart_hazard_fwd_sim \
+    +program=traces/hazard_program.hex +trace=traces/hazard_fwd.trace
 ```
 
-Every `.v` and `.sv` file under that directory is compiled, so helper
-modules are fine alongside the five required files
-(`hart.v`/`alu.v`/`imm.v`/`rf.v`/`decoder.v`). It prints the test's output,
-a pass/fail line at the end, and exits nonzero if anything failed. The
-compile log and full output land in `build/hart/`.
+The shared checker accepts `+program=...`, `+trace=...`, `+max_cycles=...`,
+`+max_idle=...`, `+check_cycles=1` and `+vcd=path.vcd`. Without path overrides,
+its defaults assume the simulator runs from `build/`. These options do not
+change the standalone no-forwarding bench's embedded tables or watchdog.
 
-If `iverilog`/`vvp` are not on your `PATH`, either put them there or say
-where they are:
+## What is checked
+
+In the shared checker, the program image is loaded into instruction memory starting
+at `0x00400000`. The testbench supplies a separate byte-addressed data memory
+at `0x10010000`, with masked combinational reads and writes at rising clock
+edges. Both memories are initialized deterministically. Instruction memory
+holds 32,768 words and data memory holds 65,536 bytes.
+
+Each expected instruction is compared when `o_retire_valid` asserts. Pipeline
+fill, stalls and flushes can take additional cycles; they do not consume an
+expected instruction. The checker compares PC, raw instruction, trap/halt,
+register operands, destination write, next PC and retire-side memory signals.
+For loads, it checks the selected bytes of `o_retire_dmem_rdata` against an
+independent memory updated from expected stores. At halt, the live memory is
+compared with that expected memory to catch missing or unexpected stores.
+
+Live memory enables must be known and mutually exclusive; enabled accesses
+must use an aligned, in-range address and a known, nonzero byte mask. An
+unknown retire-valid signal, timeout, missing file, empty trace, early halt or
+trace ending without a retiring `ebreak` fails the test.
+
+The shared checker's default limits are 250,000 total cycles and 1,000 cycles
+without retirement. The runner exposes these as `HART_MAX_CYCLES` and
+`HART_MAX_IDLE`. The no-forwarding bench has a 2,000-cycle watchdog per part.
+For example:
 
 ```sh
-IVERILOG=/opt/iverilog/bin/iverilog VVP=/opt/iverilog/bin/vvp ./run_traces.sh
+HART_MAX_IDLE=2000 make hart
+VCD=1 make hart_hazard_fwd
 ```
 
-### Running it by hand
+## Trace formats and timing
 
-Nothing about this testbench is special -- compile it the way you compile
-your own:
+`no_hazard.trace` has **12,927 records in 33 groups**. Each non-comment record
+contains 15 hexadecimal columns:
+
+```text
+pc inst trap halt rs1_raddr rs1_rdata rs2_raddr rs2_rdata rd_waddr rd_wdata mem_op mem_addr mem_mask mem_wdata next_pc
+```
+
+`mem_op` is 0 for no access, 1 for a load, and 2 for a store. `x` bits are
+don't-cares and are masked during comparison. Destination data is ignored
+when the destination is x0; store data is checked only on selected byte lanes.
+The supplied next-PC column is all don't-cares; this hazard-free program is
+sequential, so the checker independently requires `pc + 4`.
+
+The hazard traces contain `cycle=...` lines, `BUBBLE` entries, operand
+reads, optional destination writes and optional `l[...]`/`s[...]` accesses.
+Both traces describe the same **38 retired instructions**. The recorded runs
+take 91 cycles without forwarding and 49 with forwarding. The forwarding
+parser skips bubbles during functional comparison and derives branch next PCs
+from the expected operands and encoded offset.
+
+The supplied no-forwarding trace's adjacent dependencies have three bubbles,
+which assumes register-file bypass is disabled. Section 4.4 requires bypass
+enabled, so `scripts/gen_hazard_no_fwd.py` preserves the trace's expected values
+and regenerates timing for `BYPASS_EN=1`: an adjacent RAW dependency has two
+bubbles, and a taken branch still flushes two stages. Both parts of the
+no-forwarding bench always check these retirement gaps, allowing any initial
+pipeline-fill offset. The source trace files are unchanged. The generator also
+checks the source trace against the old no-bypass model and records its extra
+two bubbles after a not-taken BNE as a source discrepancy.
+
+To validate and regenerate the no-forwarding bench's embedded tables:
 
 ```sh
-iverilog -g2005 -s hart_trace_tb -o sim rtl/hart_trace_tb.v \
-    submission/hart.v submission/alu.v submission/imm.v submission/rf.v submission/decoder.v
-vvp sim
+python3 scripts/gen_hazard_no_fwd.py --write
 ```
 
-(`vvp sim`, not `./sim` -- Icarus's compiled output needs to be handed to
-`vvp` explicitly; a direct `./sim` only works by accident on some Unix
-shells and never on Windows.)
-
-The testbench looks for `vectors/hart.trace` and `vectors/hart_program.hex`
-relative to the directory you run it from. To keep them somewhere else,
-pass the paths in:
+The forwarding checker defaults to functional comparison. To compare the
+supplied absolute retirement cycles too:
 
 ```sh
-vvp sim +trace=/home/you/traces/vectors/hart.trace +program=/home/you/traces/vectors/hart_program.hex
+HART_CHECK_CYCLES=1 make hart_hazard_fwd
 ```
 
-## A pipeline may take more than one cycle per vector
+That option applies to the forwarding checker. Its functional mode does not
+prove that forwarding is implemented or that the CPU has five stages; inspect
+the design and use timing checks when validating pipeline performance.
 
-Unlike phase 3 (single-cycle -- one vector, one clock edge, always), this
-testbench advances one cycle at a time *until your design actually retires
-an instruction* before checking each vector, so fill latency, stalls, and
-flushes are all expected and never treated as a failure by themselves. If
-your design goes an unreasonably long time (millions of cycles) without
-retiring anything -- almost certainly a genuine hang or a broken
-hazard/stall condition -- the testbench gives up and reports which vector
-it was stuck waiting for, rather than simulating forever.
+## Coverage limits
 
-## Reading a failure
+The large hazard-free program covers R/I ALU operations, every supported
+load/store width, upper immediates and x0 behavior. It contains no branches,
+jumps or traps. The small hazard program exercises dependent ALU operations,
+load-use/store dependencies, false dependencies, x0, and taken/untaken branches.
+Neither program covers jumps, illegal encodings or misalignment traps.
 
-Failures print as they happen, up to twenty of them before the testbench
-goes quiet and just counts:
+The standalone no-forwarding bench adds 30 directed cases (197 retirements),
+including load-use, load-store data/address dependencies, RAW producer
+distances, false dependencies, x0, RAR/WAR/WAW and taken/untaken branches.
+Directed JAL/JALR, flush and trap tests for the forwarding bench remain part of
+person 4's assignment.
 
-```
-[FAIL] vector 9645 (LOAD_STORE.SB_LB): pc=00409a1c inst=009f8123
-         mem_wdata lane 3: got ff, expected 2a
-```
-
-Then a summary, broken down by group, and a final verdict line:
-
-```
----------- summary ----------
-vectors: 13675   passed: 13614   failed: 61   (simulated 241004 cycles)
-  LOAD_STORE.SB_LB  420/480 <-- FAIL
-  ...
-[LOAD_STORE.SB_LB FAILURE]
-
-TEST FAILED: 61 of 13675 vectors wrong.
-```
-
-The group names are the ones the autograder reports, so a
-`[LOAD_STORE.SB_LB FAILURE]` here points at the same kind of check that
-will fail there -- though not the identical vectors (see below).
-
-Vector numbers count retired instructions, in the order your design
-actually retired them -- not lines in the trace file (comments, blank
-lines, and `# --- GROUP ---` markers are skipped and not counted), not
-addresses in the program (a loop revisits the same address multiple times,
-each one its own vector; a taken branch's skipped instructions, and any
-speculatively-fetched wrong-path instruction your pipeline flushes, are
-never retired at all, so they never get a vector number), and not clock
-cycles (a stall or fill-latency bubble consumes cycles without consuming a
-vector number).
-
-## The trace files
-
-Two files work together, unlike phase 2's alu/decoder/imm/rf traces (which
-only ever needed one each):
-
-- **`vectors/hart_program.hex`** -- the actual program, as a flat
-  instruction memory image (`$readmemh` format, one instruction per line).
-  This gets loaded into a real instruction memory once, up front, at
-  `RESET_ADDR` (`0x00400000`). Your `hart.v` fetches from it the same way
-  it would fetch from real memory -- at whatever address it computes
-  itself.
-- **`vectors/hart.trace`** -- what your design should retire, one line per
-  instruction *actually retired*, in the order it actually happens (not
-  memory order). This is the only thing checked against; nothing in it is
-  driven into your design.
-
-Every column in `hart.trace` is a signal, exactly like phase 2/3's trace
-files. The header numbers them and names the signal each belongs to:
-
-```
-# columns, left to right:
-#
-#   context for this vector (also loaded into the program image):
-#    1  pc           [31:0]
-#    2  inst         [31:0]
-#
-#   compare these against the design's outputs:
-#    3  trap
-#    4  halt
-#    5  rs1_raddr    [4:0]
-...
-```
-
-and the same list appears in short form directly above every block of
-vectors. Columns are all hex. Lines starting with `#`, and blank lines, are
-comments. The `mem_*` columns (11-14) are compared against your
-`o_retire_dmem_*` ports, timed to the writeback cycle -- **not** the live
-`o_dmem_*` signals, which may belong to a different, younger instruction on
-the same cycle. See `../documentation/phase_4.pdf` for the full port list.
-
-### Don't-cares
-
-A column written as `x` (or `xx`, `xxxxxxxx`) is a **don't-care**: the
-testbench does not check it, and whatever your design drives there is
-accepted. This matters for:
-
-- **`rs1_raddr`/`rs1_rdata`** and **`rs2_raddr`/`rs2_rdata`** -- only
-  checked for instructions that actually read that operand. rs1 is
-  checked for `OP`, `OP-IMM`, `LOAD`, `STORE`, `BRANCH` and `JALR`, and
-  not for `LUI`, `AUIPC`, `JAL` or illegal encodings; rs2 is checked for
-  `OP`, `STORE` and `BRANCH`, and not for anything else. It's a
-  *class*-based rule, not "whenever the value happens to be 0," so an
-  instruction reading `x0` on purpose (`addi x1, x0, 5`) is still fully
-  checked.
-- **`rd_wdata`** -- only checked when `rd_waddr != 0`.
-- **`mem_addr`/`mem_mask`/`mem_wdata`** -- only checked when `mem_op != 0`
-  (i.e. an actual load or store retired this cycle). `mem_wdata` is
-  additionally only compared on the byte lanes `mem_mask` selects, even
-  when it *is* checked.
-
-Everything else, including on illegal or trapped instructions, is checked
-exactly -- there is no other don't-care anywhere in this trace.
-
-### What the trace exercises
-
-The program was generated once, with a fixed seed, by an instructor-side
-generator (not shipped here) and covers, in this order: every R-type and
-I-type ALU op; every load/store width at varied byte offsets against a
-real, `lui`+`addi`-loaded data address; `lui`/`auipc`; `x0`
-write-discard/read-zero through real instruction sequences; and a handful
-of small backward-branching loops. One `ebreak` ends the whole thing.
-
-Note what is *not* here. There is no `jal`/`jalr`, no branch other than
-the loops' own `blt`, no deliberate illegal encoding or misaligned access
-(a few stores do land on a misaligned address by chance and retire as
-traps, and the trace expects exactly that), and no sequence built to
-isolate one particular hazard. Dependent instructions occur back to back
-all through the program, so a broken forwarding or stall path will still
-fail here -- but nothing separates "forwarded" from "stalled", and a
-design that only ever stalls passes this trace just as well. Passing here
-is evidence that your datapath retires the right values through the
-pipeline; it is not a test of control flow, traps, or forwarding, so test
-those yourself.
-
-### The whole trace runs as one continuous execution
-
-Unlike phase 2's `alu`/`decoder`/`imm` traces (independent vectors, any one
-of which could be deleted without affecting any other), this is one
-program from reset to `ebreak`. A register written near the start is
-expected to still hold that value tens of thousands of instructions later;
-a wrong branch/jump target doesn't just fail one vector, it fetches a
-different instruction than expected for every vector after it, so a single
-control-flow bug can cascade into a large number of `[FAIL]` lines from one
-root cause. If you see many failures at once, look at the *first* one --
-later ones downstream of it are often just consequences, not independent
-bugs.
-
-## What this does not do
-
-It does not check style, does not check that your Verilog is
-synthesizable, and does not run the rule checker the autograder runs. It
-is a functional check only: a design can pass this trace and still lose
-points for using a construct the project rules forbid. Re-read the Verilog
-coding rules in `../documentation/phase_4.pdf` before submitting. It also
-does not measure cycle count / CPI.
+These are functional tests, not the assignment's RTL rule checker. Passing
+them does not establish synthesizability or compliance with all coding rules.
